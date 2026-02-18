@@ -7,16 +7,16 @@
     scale::T,
     pair::Maybe{AbstractArray{T, 4}},
     kpad_mask::Maybe{AbstractMatrix{Bool}},
-    ::Val{emb_dim}, ::Val{in_seq_bounds}, ::Val{causal}, ::Val{num_q_per_kv},
-) where {T, emb_dim, in_seq_bounds, causal, num_q_per_kv}
+    ::Val{padded_dim}, ::Val{emb_dim}, ::Val{in_seq_bounds}, ::Val{causal}, ::Val{num_q_per_kv},
+) where {T, padded_dim, emb_dim, in_seq_bounds, causal, num_q_per_kv}
     gsz = @groupsize()[1]
     kv_seq_tiles = cld(size(k, 2), gsz)
 
     # shared-memory buffers ------------------------------------------------
-    q_shm = @localmem T (gsz, emb_dim)
-    k_shm = @localmem T (emb_dim, gsz)
+    q_shm = @localmem T (gsz, padded_dim)
+    k_shm = @localmem T (padded_dim, gsz)
     s_shm = @localmem T (gsz, gsz)
-    o_shm = @localmem T (emb_dim, gsz)
+    o_shm = @localmem T (padded_dim, gsz)
 
     tidx = @index(Local)
     gidx = @index(Group, NTuple)
@@ -28,15 +28,16 @@
     kv_head_idx = cld(q_head_idx, num_q_per_kv)
 
     @inline function sh_load_emb!(dest, src, offset, mask::Bool, ::Val{tr}, head_idx) where tr
-        @unroll for i in 1:emb_dim
+        @unroll for i in 1:padded_dim
             x, y = tr ? (tidx, i) : (i, tidx)
-            @inbounds dest[x, y] = mask ? src[i, tidx + offset, head_idx, gidx[3]] : zero(T)
+            in_emb = i <= emb_dim
+            @inbounds dest[x, y] = (mask && in_emb) ? src[i, tidx + offset, head_idx, gidx[3]] : zero(T)
         end
     end
 
     # Load `q` --------------------------------------------------------------
     sh_load_emb!(q_shm, q, q_offset, in_q_seq_bounds, Val{true}(), q_head_idx)
-    @unroll for i in 1:emb_dim
+    @unroll for i in 1:padded_dim
         o_shm[i, tidx] = zero(T)
     end
     @synchronize()
@@ -125,7 +126,7 @@
         @unroll for i in 1:gsz
             s_shm[tidx, i] *= p_scale
         end
-        @unroll for i in 1:emb_dim
+        @unroll for i in 1:padded_dim
             o_shm[i, tidx] *= o_scale
         end
 
@@ -162,15 +163,14 @@ function _flash_attention(
     @assert size(k) == size(v)
     @assert size(k, 1) == emb_dim
     @assert size(k, 4) == B
-    ispow2(emb_dim) || error("Only power-of-2 embedding dims are supported.")
-    
     # Validate grouped-query attention: num_q_heads must be divisible by num_kv_heads
     @assert QH % KVH == 0 "Number of query heads ($QH) must be divisible by number of KV heads ($KVH)"
     num_q_per_kv = QH ÷ KVH
 
+    padded_dim   = nextpow(2, emb_dim)
     kab          = get_backend(q)
     target_shmem = shared_memory(kab, KA.device(kab))
-    gsz          = flash_attention_groupsize(T; emb_dim, target_shmem)
+    gsz          = flash_attention_groupsize(T; emb_dim=padded_dim, target_shmem)
 
     q_seq_tiles, kv_seq_tiles = cld.((QL, KL), gsz)
     threads   = (gsz, 1, 1)
@@ -179,11 +179,11 @@ function _flash_attention(
     scale     = T(inv(sqrt(emb_dim)))
 
     # mma tile configs ------------------------------------------------------
-    BM, BK, BN = gsz, emb_dim, gsz
+    BM, BK, BN = gsz, padded_dim, gsz
     TM, TN     = flash_attention_mma_thread_cfg(gsz; BM, BN)
     cfg        = FATileConfig{BM,BK,BN,TM,TN,false,false,false}
 
-    BM, BK, BN = gsz, gsz, emb_dim
+    BM, BK, BN = gsz, gsz, padded_dim
     TM, TN     = flash_attention_mma_thread_cfg(gsz; BM, BN)
     cfg_out    = FATileConfig{BM,BK,BN,TM,TN,false,true,true}
 
@@ -195,7 +195,7 @@ function _flash_attention(
     _flash_attention_fwd!(kab, threads)(
         cfg, cfg_out,
         o, ms, ls, q, k, v, scale, pair, kpad_mask,
-        Val(emb_dim), Val(in_bounds), Val(causal), Val(num_q_per_kv);   # flags
+        Val(padded_dim), Val(emb_dim), Val(in_bounds), Val(causal), Val(num_q_per_kv);
         ndrange)
 
     return o, ms, ls
@@ -222,7 +222,7 @@ function flash_attention_groupsize(::Type{T}; emb_dim::Int, target_shmem::UInt64
     # qk_fp16s = (false, true)
     # TODO prefer bigger groupsize?
     qk_fp16s = (true,)
-    for qk_fp16 in qk_fp16s, groupsize in (256, 128, 64, 32, 16)
+    for qk_fp16 in qk_fp16s, groupsize in (256, 128, 64, 32, 16, 8, 4)
         shmem = flash_attention_shmem_bwd(T; emb_dim, groupsize, qk_fp16)
         shmem ≤ target_shmem && return groupsize
     end
@@ -230,12 +230,22 @@ function flash_attention_groupsize(::Type{T}; emb_dim::Int, target_shmem::UInt64
 end
 
 function flash_attention_mma_thread_cfg(groupsize::Int; BM::Int, BN::Int)::Tuple{Int, Int}
-    tmp = (BM * BN) ÷ groupsize
-    x = Int(log2(tmp))
+    total = (BM * BN) ÷ groupsize
+    x = Int(log2(total))
     TM, TN = if iseven(x)
-        2^(x / 2), 2^(x / 2)
+        2^(x ÷ 2), 2^(x ÷ 2)
     else
-        2^((x + 1) / 2), 2^((x - 1) / 2)
+        2^((x + 1) ÷ 2), 2^((x - 1) ÷ 2)
+    end
+
+    # Clamp tile sizes to matrix bounds: TM ≤ BM and TN ≤ BN.
+    # At most one clamp can trigger since TM*TN = BM*BN/gsz ≤ BM*BN.
+    if TM > BM
+        TM = BM
+        TN = total ÷ TM
+    elseif TN > BN
+        TN = BN
+        TM = total ÷ TN
     end
 
     @assert groupsize == (BM * BN) ÷ (TM * TN)

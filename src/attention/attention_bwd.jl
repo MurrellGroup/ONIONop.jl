@@ -8,18 +8,18 @@
     scale::T,
     pair::Maybe{AbstractArray{T,4}}, # ← pair tensor
     kpad_mask::Maybe{AbstractMatrix{Bool}},
-    ::Val{emb_dim}, ::Val{in_seq_bounds}, ::Val{causal}, ::Val{num_q_per_kv},
-) where {T, emb_dim, in_seq_bounds, causal, num_q_per_kv}
+    ::Val{padded_dim}, ::Val{emb_dim}, ::Val{in_seq_bounds}, ::Val{causal}, ::Val{num_q_per_kv},
+) where {T, padded_dim, emb_dim, in_seq_bounds, causal, num_q_per_kv}
     gsz = @groupsize()[1]
     q_seq_tiles = cld(size(q, 2), gsz)
     kv_seq_tiles = cld(size(k, 2), gsz)
 
     # ------------------------------------------------------------------ shmem
-    q_shm = @localmem Float16 (gsz, emb_dim)
-    k_shm = @localmem Float16 (emb_dim, gsz)
+    q_shm = @localmem Float16 (gsz, padded_dim)
+    k_shm = @localmem Float16 (padded_dim, gsz)
     s_shm = @localmem T       (gsz, gsz)   # scores / dS
-    Δ_shm = @localmem T       (emb_dim, gsz)
-    d_shm = @localmem T       (emb_dim, gsz)
+    Δ_shm = @localmem T       (padded_dim, gsz)
+    d_shm = @localmem T       (padded_dim, gsz)
 
     tidx = @index(Local)
     gidx = @index(Group, NTuple)          # (head, batch) in this kernel
@@ -29,9 +29,10 @@
     kv_head_idx = cld(q_head_idx, num_q_per_kv)
 
     @inline function sh_load_emb!(dest, src, offset, mask::Bool, ::Val{tr}, head_idx) where tr
-        @unroll for i in 1:emb_dim
+        @unroll for i in 1:padded_dim
             x, y = tr ? (tidx, i) : (i, tidx)
-            @inbounds dest[x,y] = mask ? src[i, tidx+offset, head_idx, gidx[2]] : zero(T)
+            in_emb = i <= emb_dim
+            @inbounds dest[x,y] = (mask && in_emb) ? src[i, tidx+offset, head_idx, gidx[2]] : zero(T)
         end
     end
 
@@ -87,13 +88,20 @@
             in_ms = in_seq_bounds || tidx + lo_q ≤ size(ms,1)
             m_i   = in_ms ? ms[tidx + lo_q, q_head_idx, gidx[2]] : typemax(T)
             @unroll for j in 1:gsz
-                s_shm[tidx, j] = exp(s_shm[tidx, j] - m_i)
+                # OOB K positions must get P=0 to match forward.  Without this,
+                # exp(0 - m_i) can overflow to Inf, producing NaN via Inf*0 in
+                # the dQ matmul (dQ += dS @ K where K_oob = 0).
+                if in_seq_bounds || j + lo_k ≤ size(k, 2)
+                    s_shm[tidx, j] = exp(s_shm[tidx, j] - m_i)
+                else
+                    s_shm[tidx, j] = zero(T)
+                end
             end
 
             # -------------------- dV ------------------------------------
             in_dv = in_seq_bounds || tidx + lo_k ≤ size(dv,2)
             # Don't load existing dv - compute fresh contribution for atomic add
-            @unroll for i in 1:emb_dim
+            @unroll for i in 1:padded_dim
                 d_shm[i, tidx] = zero(T)
             end
             @synchronize()
@@ -133,7 +141,7 @@
             end
             # -------------------- dK ------------------------------------
             # Don't load existing dk - compute fresh contribution for atomic add
-            @unroll for i in 1:emb_dim
+            @unroll for i in 1:padded_dim
                 d_shm[i, tidx] = zero(T)
             end
             @synchronize()
@@ -181,8 +189,9 @@ end
     in_q_seq_bounds = in_seq_bounds || tidx + q_offset ≤ size(ls, 1)
     in_q_seq_bounds || return
 
-    # Δ = Δ / ls
-    inv_denom = inv(ls[tidx + q_offset, gidx[2], gidx[3]])
+    # Δ = Δ / ls  (guard against ls=0 → inv(0)=Inf → 0*Inf=NaN)
+    l = ls[tidx + q_offset, gidx[2], gidx[3]]
+    inv_denom = l == zero(T) ? zero(T) : inv(l)
     Δ_scaled_v = @view(Δ_scaled[:, tidx + q_offset, gidx[2], gidx[3]])
     Δ_v = @view(Δ[:, tidx + q_offset, gidx[2], gidx[3]])
     @unroll for i in 1:emb_dim
@@ -213,9 +222,10 @@ function ∇flash_attention(
     @assert QH % KVH == 0 "Number of query heads ($QH) must be divisible by number of KV heads ($KVH)"
     num_q_per_kv = QH ÷ KVH
 
+    padded_dim   = nextpow(2, emb_dim)
     kab          = get_backend(q)
     target_shmem = shared_memory(kab, KA.device(kab))
-    gsz          = flash_attention_groupsize(T; emb_dim, target_shmem)
+    gsz          = flash_attention_groupsize(T; emb_dim=padded_dim, target_shmem)
 
     q_tiles, k_tiles = cld.((QL, KL), gsz)
     in_bounds = QL % gsz == 0 && KL % gsz == 0
@@ -236,21 +246,21 @@ function ∇flash_attention(
         KA.allocate(kab, T, (0,0,0,0)) :   # harmless dummy
         KA.zeros(kab, T, size(pair))
 
-    # ---------------- MMA configs (unchanged) ----------------------------
-    BM,BK,BN = gsz, emb_dim, gsz
+    # ---------------- MMA configs ----------------------------------------
+    BM,BK,BN = gsz, padded_dim, gsz
     TM,TN    = flash_attention_mma_thread_cfg(gsz; BM, BN)
     cfg      = FATileConfig{BM,BK,BN,TM,TN,false,false,false}
 
-    BM,BK,BN = emb_dim, gsz, gsz
+    BM,BK,BN = padded_dim, gsz, gsz
     TM,TN    = flash_attention_mma_thread_cfg(gsz; BM, BN)
     cfg_dv   = FATileConfig{BM,BK,BN,TM,TN,false,false,false}
 
-    BM,BK,BN = gsz, gsz, emb_dim
+    BM,BK,BN = gsz, gsz, padded_dim
     TM,TN    = flash_attention_mma_thread_cfg(gsz; BM, BN)
     cfg_dk   = FATileConfig{BM,BK,BN,TM,TN,true,false,true}
     cfg_dq   = FATileConfig{BM,BK,BN,TM,TN,false,true,true}
 
-    BM,BK,BN = gsz, emb_dim, gsz
+    BM,BK,BN = gsz, padded_dim, gsz
     TM,TN    = flash_attention_mma_thread_cfg(gsz; BM, BN)
     cfg_ds   = FATileConfig{BM,BK,BN,TM,TN,true,false,false}
 
@@ -264,7 +274,7 @@ function ∇flash_attention(
         o, ms,
         q, k, v, scale,
         pair, kpad_mask,
-        Val(emb_dim), Val(in_bounds), Val(causal), Val(num_q_per_kv);
+        Val(padded_dim), Val(emb_dim), Val(in_bounds), Val(causal), Val(num_q_per_kv);
         ndrange)
 
     return dq, dk, dv, (isnothing(pair) ? nothing : dp)
