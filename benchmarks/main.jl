@@ -302,6 +302,245 @@ function test_softmax(kab)
     return
 end
 
+struct BenchElementwiseProduct{F} end
+
+NNop.pair_feature_dim(::BenchElementwiseProduct{F}) where F = F
+
+@inline function NNop.pair_feature_tuple(
+    ::BenchElementwiseProduct{F},
+    qvals::NTuple{F, T},
+    kvals::NTuple{F, T},
+) where {F, T}
+    return ntuple(i -> qvals[i] * kvals[i], Val(F))
+end
+
+@inline function NNop.pair_feature_tuple_pullback(
+    ::BenchElementwiseProduct{F},
+    qvals::NTuple{F, T},
+    kvals::NTuple{F, T},
+    dphi::NTuple{F, T},
+) where {F, T}
+    dq = ntuple(i -> dphi[i] * kvals[i], Val(F))
+    dk = ntuple(i -> dphi[i] * qvals[i], Val(F))
+    return dq, dk
+end
+
+function materialize_elementwise_product_pair_bias(q_features, k_features, pair_proj)
+    # pair_proj: (QH, F), q_features/k_features: (F, L, B)
+    # bias: (QH, QL, KL, B)
+    pair = reshape(pair_proj, size(pair_proj, 1), size(pair_proj, 2), 1, 1, 1) .*
+        reshape(q_features, 1, size(q_features, 1), size(q_features, 2), 1, size(q_features, 3)) .*
+        reshape(k_features, 1, size(k_features, 1), 1, size(k_features, 2), size(k_features, 3))
+    return dropdims(sum(pair; dims=2); dims=2)
+end
+
+function test_pair_feature_attention(kab)
+    Random.seed!(0)
+    T = Float32
+
+    for (E, L, QH, KVH, B, F, causal) in [
+        (64,  256,  8, 2, 4, 8, false),
+        (64,  256,  8, 2, 4, 8, true),
+        (64,  512,  8, 2, 4, 16, false),
+        (64, 1024,  8, 2, 4, 16, false),
+        (64, 2048,  4, 4, 2, 8, false),
+    ]
+        println("\n─── E=$E, L=$L, QH=$QH, KVH=$KVH, B=$B, F=$F, causal=$causal ───")
+
+        q = Adapt.adapt(kab, randn(T, E, L, QH, B))
+        k = Adapt.adapt(kab, randn(T, E, L, KVH, B))
+        v = Adapt.adapt(kab, randn(T, E, L, KVH, B))
+        q_features = Adapt.adapt(kab, randn(T, F, L, B))
+        k_features = Adapt.adapt(kab, randn(T, F, L, B))
+        pair_proj = Adapt.adapt(kab, randn(T, QH, F))
+        pair_op = BenchElementwiseProduct{F}()
+
+        # Materialized pair bias tensor size.
+        pair_bytes = sizeof(T) * QH * L * L * B
+        println("  Pair bias tensor: $(Base.format_bytes(pair_bytes))")
+
+        # Warmup & correctness check.
+        pair_mat = materialize_elementwise_product_pair_bias(q_features, k_features, pair_proj)
+        o_mat = NNop.flash_attention(q, k, v, pair_mat; causal)
+        o_fused = NNop.flash_attention(q, k, v, q_features, k_features, pair_proj, pair_op; causal)
+        @assert isapprox(o_mat, o_fused; atol=1e-2, rtol=1e-2) "Forward mismatch"
+
+        GC.gc(false); GC.gc(true)
+        cache = GPUArrays.AllocCache()
+
+        println("  Materialized FWD:")
+        @btime GPUArrays.@cached $cache begin
+            pair = materialize_elementwise_product_pair_bias($q_features, $k_features, $pair_proj)
+            NNop.flash_attention($q, $k, $v, pair; causal=$causal)
+            KA.synchronize($kab)
+        end
+        println("   - Peak memory: $(Base.format_bytes(sizeof(cache)))")
+        GPUArrays.unsafe_free!(cache)
+
+        println("  Fused FWD:")
+        @btime GPUArrays.@cached $cache begin
+            NNop.flash_attention($q, $k, $v, $q_features, $k_features, $pair_proj, $pair_op; causal=$causal)
+            KA.synchronize($kab)
+        end
+        println("   - Peak memory: $(Base.format_bytes(sizeof(cache)))")
+        GPUArrays.unsafe_free!(cache)
+
+        println("  Materialized FWD + BWD:")
+        @btime GPUArrays.@cached $cache begin
+            Zygote.gradient($q, $k, $v, $q_features, $k_features, $pair_proj) do q, k, v, qf, kf, pp
+                pair = materialize_elementwise_product_pair_bias(qf, kf, pp)
+                sum(NNop.flash_attention(q, k, v, pair; causal=$causal))
+            end
+            KA.synchronize($kab)
+        end
+        println("   - Peak memory: $(Base.format_bytes(sizeof(cache)))")
+        GPUArrays.unsafe_free!(cache)
+
+        println("  Fused FWD + BWD:")
+        @btime GPUArrays.@cached $cache begin
+            Zygote.gradient($q, $k, $v, $q_features, $k_features, $pair_proj) do q, k, v, qf, kf, pp
+                sum(NNop.flash_attention(q, k, v, qf, kf, pp, $pair_op; causal=$causal))
+            end
+            KA.synchronize($kab)
+        end
+        println("   - Peak memory: $(Base.format_bytes(sizeof(cache)))")
+        GPUArrays.unsafe_free!(cache)
+    end
+    return
+end
+
+struct BenchDirLeakyReLUDist{T}
+    negative_slope::T
+    eps::T
+end
+
+NNop.pair_feature_dim(::BenchDirLeakyReLUDist) = 9
+
+@inline function _bench_lrelu(slope::T, delta::T) where T
+    return ifelse(delta ≥ zero(T), delta, slope * delta)
+end
+
+@inline function NNop.pair_feature_tuple(
+    op::BenchDirLeakyReLUDist{T},
+    qvals::NTuple{4, T},
+    kvals::NTuple{4, T},
+) where T
+    d1 = qvals[1] - kvals[1]
+    d2 = qvals[2] - kvals[2]
+    d3 = qvals[3] - kvals[3]
+    d4 = qvals[4] - kvals[4]
+    s = op.negative_slope
+    r = sqrt(d1 * d1 + d2 * d2 + d3 * d3 + op.eps)
+    return (
+        _bench_lrelu(s, d1), _bench_lrelu(s, -d1),
+        _bench_lrelu(s, d2), _bench_lrelu(s, -d2),
+        _bench_lrelu(s, d3), _bench_lrelu(s, -d3),
+        _bench_lrelu(s, d4), _bench_lrelu(s, -d4),
+        r,
+    )
+end
+
+function materialize_dir_lrelu_dist_pair_bias(q_features, k_features, pair_proj, negative_slope, eps)
+    lrelu(x) = ifelse.(x .>= zero(eltype(x)), x, negative_slope .* x)
+    deltas = map(1:4) do f
+        reshape(q_features[f, :, :], 1, size(q_features, 2), 1, size(q_features, 3)) .-
+            reshape(k_features[f, :, :], 1, 1, size(k_features, 2), size(k_features, 3))
+    end
+    r = sqrt.(deltas[1] .^ 2 .+ deltas[2] .^ 2 .+ deltas[3] .^ 2 .+ eps)
+    features = [
+        lrelu(deltas[1]), lrelu(-deltas[1]),
+        lrelu(deltas[2]), lrelu(-deltas[2]),
+        lrelu(deltas[3]), lrelu(-deltas[3]),
+        lrelu(deltas[4]), lrelu(-deltas[4]),
+        r,
+    ]
+    return sum(reshape(pair_proj[:, p], :, 1, 1, 1) .* features[p] for p in 1:9)
+end
+
+function test_pair_feature_dir_lrelu_dist(kab)
+    Random.seed!(0)
+    T = Float32
+    E, L, QH, KVH, B = 64, 4096, 4, 4, 4
+    F = 4          # input feature dim
+    PD = 9         # pair feature dim (2*F + 1)
+    negative_slope = T(0.1)
+    eps = T(1e-4)
+    causal = false
+
+    println("\n═══ Directional LeakyReLU + Distance pair features ═══")
+    println("  E=$E, L=$L, QH=$QH, KVH=$KVH, B=$B, F=$F, PD=$PD, causal=$causal")
+
+    q = Adapt.adapt(kab, randn(T, E, L, QH, B))
+    k = Adapt.adapt(kab, randn(T, E, L, KVH, B))
+    v = Adapt.adapt(kab, randn(T, E, L, KVH, B))
+    q_features = Adapt.adapt(kab, randn(T, F, L, B))
+    k_features = Adapt.adapt(kab, randn(T, F, L, B))
+    pair_proj = Adapt.adapt(kab, randn(T, QH, PD))
+    pair_op = BenchDirLeakyReLUDist{T}(negative_slope, eps)
+
+    pair_bytes = sizeof(T) * QH * L * L * B
+    println("  Materialized pair bias tensor: $(Base.format_bytes(pair_bytes))")
+
+    # Warmup + correctness.
+    pair_mat = materialize_dir_lrelu_dist_pair_bias(q_features, k_features, pair_proj, negative_slope, eps)
+    o_mat = NNop.flash_attention(q, k, v, pair_mat; causal)
+    o_fused = NNop.flash_attention(q, k, v, q_features, k_features, pair_proj, pair_op; causal)
+    @assert isapprox(o_mat, o_fused; atol=1e-2, rtol=1e-2) "Forward mismatch"
+
+    GC.gc(false); GC.gc(true)
+    cache = GPUArrays.AllocCache()
+
+    println("\n  Materialized FWD:")
+    @btime GPUArrays.@cached $cache begin
+        pair = materialize_dir_lrelu_dist_pair_bias($q_features, $k_features, $pair_proj, $negative_slope, $eps)
+        NNop.flash_attention($q, $k, $v, pair; causal=$causal)
+        KA.synchronize($kab)
+    end
+    println("   - Peak memory: $(Base.format_bytes(sizeof(cache)))")
+    GPUArrays.unsafe_free!(cache)
+
+    println("  Fused FWD:")
+    @btime GPUArrays.@cached $cache begin
+        NNop.flash_attention($q, $k, $v, $q_features, $k_features, $pair_proj, $pair_op; causal=$causal)
+        KA.synchronize($kab)
+    end
+    println("   - Peak memory: $(Base.format_bytes(sizeof(cache)))")
+    GPUArrays.unsafe_free!(cache)
+
+    println("\n  Materialized FWD + BWD (all grads):")
+    @btime GPUArrays.@cached $cache begin
+        Zygote.gradient($q, $k, $v, $q_features, $k_features, $pair_proj) do q, k, v, qf, kf, pp
+            pair = materialize_dir_lrelu_dist_pair_bias(qf, kf, pp, $negative_slope, $eps)
+            sum(NNop.flash_attention(q, k, v, pair; causal=$causal))
+        end
+        KA.synchronize($kab)
+    end
+    println("   - Peak memory: $(Base.format_bytes(sizeof(cache)))")
+    GPUArrays.unsafe_free!(cache)
+
+    println("  Fused FWD + BWD (proj grads only, feature_grads=false):")
+    @btime GPUArrays.@cached $cache begin
+        Zygote.gradient($q, $k, $v, $q_features, $k_features, $pair_proj) do q, k, v, qf, kf, pp
+            sum(NNop.flash_attention(q, k, v, qf, kf, pp, $pair_op; causal=$causal, feature_grads=false))
+        end
+        KA.synchronize($kab)
+    end
+    println("   - Peak memory: $(Base.format_bytes(sizeof(cache)))")
+    GPUArrays.unsafe_free!(cache)
+
+    println("  Fused FWD + BWD (all grads, feature_grads=true):")
+    @btime GPUArrays.@cached $cache begin
+        Zygote.gradient($q, $k, $v, $q_features, $k_features, $pair_proj) do q, k, v, qf, kf, pp
+            sum(NNop.flash_attention(q, k, v, qf, kf, pp, $pair_op; causal=$causal, feature_grads=true))
+        end
+        KA.synchronize($kab)
+    end
+    println("   - Peak memory: $(Base.format_bytes(sizeof(cache)))")
+    GPUArrays.unsafe_free!(cache)
+
+    return
+end
+
 function test_flash_attention(kab)
     Random.seed!(0)
     T = Float16

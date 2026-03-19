@@ -19,6 +19,7 @@ include("mma.jl")
 include("attention.jl")
 include("attention_bwd.jl")
 include("attention_crc.jl")
+include("pair_feature_attention.jl")
 include("rms_norm.jl")
 include("layer_norm.jl")
 

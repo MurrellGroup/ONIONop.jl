@@ -218,13 +218,7 @@ function ∇flash_attention(
     causal::Bool,
     kpad_mask::Maybe{AbstractMatrix{Bool}} = nothing,
 ) where T <: Union{Float16, Float32}
-    QE, QL, QH, B = size(q)
-    KE, KL, KH, KB = size(k)
-
-    QE == KE || error("Embedding dim of Q `$QE` must be the same as of K `$KE`.")
-    size(k) == size(v) || error("Shapes of K `$(size(k))` and V `$(size(v))` must be the same.")
-    ispow2(QE) || error("Only power-of-2 embedding dims are supported.")
-    QH % KH == 0 || error("Number of query heads `$QH` must be divisible by number of KV heads `$KH`.")
+    QE, QL, QH, B, KE, KL, KH, KB = check_flash_attention_sizes(q, k, v, pair)
 
     kab          = get_backend(q)
     target_shmem = shared_memory(kab, KA.device(kab))

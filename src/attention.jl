@@ -5,6 +5,30 @@ function wmma!(c::AbstractMatrix, a::AbstractMatrix, b::AbstractMatrix, cfg, tid
 
 supports_wmma(kab) = false
 
+function check_flash_attention_sizes(
+    q::AbstractArray{T,4},
+    k::AbstractArray{T,4},
+    v::AbstractArray{T,4},
+    pair::Union{Nothing,AbstractArray{T,4}},
+) where T
+    QE, QL, QH, B = size(q)
+    KE, KL, KH, KB = size(k)
+
+    QE == KE || error("Embedding dim of Q `$QE` must be the same as of K `$KE`.")
+    size(k) == size(v) || error("Shapes of K `$(size(k))` and V `$(size(v))` must be the same.")
+    B == KB || error("Batch size of Q `$B` must be the same as of K/V `$KB`.")
+    ispow2(QE) || error("Only power-of-2 embedding dims are supported.")
+    QH % KH == 0 || error("Number of query heads `$QH` must be divisible by number of KV heads `$KH`.")
+
+    if !isnothing(pair)
+        expected_pair = (QH, QL, KL, B)
+        size(pair) == expected_pair ||
+            error("Shape of pair bias `$(size(pair))` must be `(QH, QL, KL, B) = $expected_pair`.")
+    end
+
+    return QE, QL, QH, B, KE, KL, KH, KB
+end
+
 @kernel unsafe_indices=true cpu=false inbounds=true function _flash_attention_fwd!(
     cfg::Type{C}, cfg_out,
     # outputs
@@ -147,13 +171,7 @@ function _flash_attention(
     pair::Union{Nothing,AbstractArray{T,4}} = nothing;
     causal::Bool, kpad_mask::Union{Nothing,AbstractMatrix{Bool}} = nothing,
 ) where T <: Union{Float16, Float32}
-    QE, QL, QH, B = size(q)
-    KE, KL, KH, KB = size(k)
-
-    QE == KE || error("Embedding dim of Q `$QE` must be the same as of K `$KE`.")
-    size(k) == size(v) || error("Shapes of K `$(size(k))` and V `$(size(v))` must be the same.")
-    ispow2(QE) || error("Only power-of-2 embedding dims are supported.")
-    QH % KH == 0 || error("Number of query heads `$QH` must be divisible by number of KV heads `$KH`.")
+    QE, QL, QH, B, KE, KL, KH, KB = check_flash_attention_sizes(q, k, v, pair)
 
     kab          = get_backend(q)
     target_shmem = shared_memory(kab, KA.device(kab))
